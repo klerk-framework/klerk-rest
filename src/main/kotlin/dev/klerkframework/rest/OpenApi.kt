@@ -46,6 +46,21 @@ internal fun <C : KlerkContext, V> openApiDocument(
         putJsonArray("servers") { add(buildJsonObject { put("url", basePath) }) }
         putJsonArray("security") { add(buildJsonObject { putJsonArray("bearerAuth") {} }) }
         putJsonObject("paths") {
+            putJsonObject("/api-info") {
+                putJsonObject("get") {
+                    put("operationId", "getApiInfo")
+                    put("summary", "Name, version, release date and status of the API")
+                    putJsonArray("security") {}
+                    putJsonObject("responses") {
+                        putJsonObject("200") {
+                            put("description", "The API")
+                            putJsonObject("content") {
+                                putJsonObject("application/json") { put("schema", ref("ApiInfo")) }
+                            }
+                        }
+                    }
+                }
+            }
             for (resource in resources) {
                 val collection = "/${resource.collection}"
                 putJsonObject(collection) {
@@ -79,7 +94,8 @@ internal fun <C : KlerkContext, V> openApiDocument(
             }
             putJsonObject("schemas") {
                 put("Problem", problemSchema())
-                put("Action", actionSchema())
+                put("Link", linkSchema())
+                put("ApiInfo", apiInfoSchema())
                 for (resource in resources) {
                     val props = ObjectSchema.of(resource.kClass)
                     put("${resource.modelName}Props", objectSchema(props, translation)?.allRequired() ?: genericObject())
@@ -131,22 +147,56 @@ private fun problemSchema() =
         }
     }
 
-private fun actionSchema() =
+private fun linkSchema() =
     buildJsonObject {
         put("type", "object")
         putJsonObject("properties") {
-            putJsonObject("event") { put("type", "string") }
+            putJsonObject("rel") {
+                put("type", "string")
+                put("description", "self, first, next, or the kebab-case name of an event")
+            }
+            putJsonObject("href") {
+                put("type", "string")
+                put("format", "uri")
+            }
             putJsonObject("method") { put("type", "string") }
-            putJsonObject("href") { put("type", "string") }
+            putJsonObject("title") {
+                put("type", "string")
+                put("description", "The name of the event")
+            }
             putJsonObject("params") {
                 put("type", "string")
                 put("description", "URI of the schema of the request body. Left out if the event takes no body")
             }
         }
         putJsonArray("required") {
-            add("event")
-            add("method")
+            add("rel")
             add("href")
+            add("method")
+        }
+    }
+
+private fun apiInfoSchema() =
+    buildJsonObject {
+        put("type", "object")
+        putJsonObject("properties") {
+            putJsonObject("apiName") { put("type", "string") }
+            putJsonObject("apiVersion") { put("type", "string") }
+            putJsonObject("apiReleased") {
+                put("type", "string")
+                put("format", "date")
+            }
+            putJsonObject("apiDocumentation") {
+                put("type", "string")
+                put("format", "uri")
+            }
+            putJsonObject("apiStatus") {
+                put("type", "string")
+                putJsonArray("enum") { ApiStatus.entries.forEach { add(it.value) } }
+            }
+        }
+        putJsonArray("required") {
+            for (name in listOf("apiName", "apiVersion", "apiReleased", "apiDocumentation", "apiStatus")) add(name)
         }
     }
 
@@ -154,7 +204,7 @@ private fun modelSchema(resource: Resource<*>) =
     buildJsonObject {
         put("type", "object")
         putJsonObject("properties") {
-            for (name in listOf("id", "href", "type", "state")) putJsonObject(name) { put("type", "string") }
+            for (name in listOf("id", "type", "state")) putJsonObject(name) { put("type", "string") }
             for (name in listOf("createdAt", "lastModifiedAt")) {
                 putJsonObject(name) {
                     put("type", "string")
@@ -162,13 +212,13 @@ private fun modelSchema(resource: Resource<*>) =
                 }
             }
             put("props", ref("${resource.modelName}Props"))
-            putJsonObject("actions") {
+            putJsonObject("_links") {
                 put("type", "array")
-                put("items", ref("Action"))
+                put("items", ref("Link"))
             }
         }
         putJsonArray("required") {
-            for (name in listOf("id", "href", "type", "state", "createdAt", "lastModifiedAt", "props")) add(name)
+            for (name in listOf("id", "type", "state", "createdAt", "lastModifiedAt", "props", "_links")) add(name)
         }
     }
 
@@ -176,13 +226,27 @@ private fun listSchema(resource: Resource<*>) =
     buildJsonObject {
         put("type", "object")
         putJsonObject("properties") {
+            putJsonObject("_meta") {
+                put("type", "object")
+                putJsonObject("properties") {
+                    putJsonObject("count") { put("type", "integer") }
+                    putJsonObject("limit") { put("type", "integer") }
+                }
+            }
+            putJsonObject("_links") {
+                put("type", "array")
+                put("items", ref("Link"))
+            }
             putJsonObject("items") {
                 put("type", "array")
                 put("items", ref(resource.modelName))
             }
-            putJsonObject("nextCursor") { put("type", "string") }
         }
-        putJsonArray("required") { add("items") }
+        putJsonArray("required") {
+            add("_meta")
+            add("_links")
+            add("items")
+        }
     }
 
 private fun parameter(
@@ -252,7 +316,7 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.listOperation(resource:
                 "cursor",
                 "query",
                 buildJsonObject { put("type", "string") },
-                "nextCursor of the previous page",
+                "The cursor of the next link of the previous page",
             ),
         )
         add(
@@ -268,13 +332,13 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.listOperation(resource:
                 "actions",
                 "query",
                 buildJsonObject { put("type", "boolean") },
-                "Include the actions of each model. Slower",
+                "Include a link for each event the client may execute on each model. Slower",
             ),
         )
     }
     putJsonObject("responses") {
         putJsonObject("200") {
-            put("description", "A page of ${resource.collection}. The Link header has rel=next when there is more")
+            put("description", "A page of ${resource.collection}. _links has rel=next when there is more, and so does the Link header")
             putJsonObject("content") {
                 putJsonObject("application/json") { put("schema", ref("${resource.modelName}List")) }
             }
@@ -285,7 +349,7 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.listOperation(resource:
 
 private fun kotlinx.serialization.json.JsonObjectBuilder.getOperation(resource: Resource<*>) {
     put("operationId", "get${resource.modelName}")
-    put("summary", "Gets a ${resource.modelName}, with the actions the client may execute on it now")
+    put("summary", "Gets a ${resource.modelName}, with links to the events the client may execute on it now")
     putJsonArray("parameters") { add(idParameter) }
     putJsonObject("responses") {
         putJsonObject("200") {

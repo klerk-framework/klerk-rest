@@ -88,43 +88,35 @@ internal fun etag(model: Model<*>): String {
 }
 
 internal fun ModelID<*>.href(
-    basePath: String,
+    base: String,
     resource: Resource<*>,
-): String = "$basePath/${resource.collection}/$this"
+): String = "$base/${resource.collection}/$this"
 
 /**
- * The model as JSON. [actions] are the events the client may execute on it now, or null to leave them out.
+ * The model as JSON. [base] is the absolute URL of the API root. `_links` has `self` and, if [actions] is not null,
+ * a link for each event the client may execute on the model now.
  */
 internal fun <C : KlerkContext> modelToJson(
     model: Model<*>,
     resource: Resource<C>,
-    basePath: String,
+    base: String,
     actions: Collection<Event<*, *>>?,
 ): JsonObject =
     buildJsonObject {
-        val self = model.id.href(basePath, resource)
+        val self = model.id.href(base, resource)
         put("id", model.id.toString())
-        put("href", self)
         put("type", resource.modelName)
         put("state", model.state)
         put("createdAt", model.createdAt.toString())
         put("lastModifiedAt", model.lastModifiedAt.toString())
         put("props", valueToJson(model.props))
-        actions?.let { events ->
-            putJsonArray("actions") {
-                for (event in events.sortedBy { it.name }) {
-                    val name = resource.uriName(event) ?: continue
-                    add(
-                        buildJsonObject {
-                            put("event", event.name)
-                            put("method", "POST")
-                            put("href", "$self/events/$name")
-                            if (hasParameters(event)) {
-                                put("params", "$basePath/openapi.json#/components/schemas/${resource.schemaName(event)}")
-                            }
-                        },
-                    )
-                }
+        putJsonArray("_links") {
+            add(link("self", self, "GET"))
+            for (event in actions.orEmpty().sortedBy { it.name }) {
+                val name = resource.uriName(event) ?: continue
+                val params =
+                    if (hasParameters(event)) "$base/openapi.json#/components/schemas/${resource.schemaName(event)}" else null
+                add(link(name, "$self/events/$name", "POST", event.name, params))
             }
         }
     }

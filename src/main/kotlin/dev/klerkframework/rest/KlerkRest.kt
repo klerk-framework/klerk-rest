@@ -44,7 +44,9 @@ import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import org.slf4j.LoggerFactory
+import java.time.LocalDate
 
 /**
  * Decides who the client of a request is, typically from its `Authorization` header. Returns `null` to reject the
@@ -54,6 +56,8 @@ public typealias ContextProvider<C> = suspend (ApplicationCall) -> C?
 
 private val logger = LoggerFactory.getLogger("dev.klerkframework.rest.KlerkRest")
 
+private val SEMVER = Regex("""(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)""")
+
 /**
  * Serves [klerk] as a REST API under [basePath]. See the klerk-rest README for the endpoints.
  *
@@ -62,7 +66,14 @@ private val logger = LoggerFactory.getLogger("dev.klerkframework.rest.KlerkRest"
  * Klerk's authorization rules apply to everything the client does.
  *
  * The API is described by the OpenAPI document at `$basePath/openapi.json`, which does not require authentication.
- * [title] and [version] are shown in it.
+ * [title] and [version] are shown in it. [version] must be a semantic version (`MAJOR.MINOR.PATCH`), and the major
+ * version of an [ApiStatus.Alpha] or [ApiStatus.Beta] API must be 0.
+ *
+ * `GET $basePath/api-info` tells the client the API's name ([title]), [version], [released] date, [status] and the URL
+ * of the OpenAPI document. It does not require authentication. [released] is today by default.
+ *
+ * URLs in responses are absolute. Behind a gateway, send a `Forwarded` header (RFC 7239) with `proto`, `host`, and
+ * optionally `port` and `prefix` (the gateway's base URL of the API, replacing [basePath]).
  *
  * If [requireIdempotencyKey] is true, a request that executes an event without an `Idempotency-Key` header is rejected
  * with `400 Bad Request`. Only the first successful request with a key is applied, so the client can retry safely.
@@ -76,7 +87,13 @@ public fun <C : KlerkContext, V> Application.klerkRest(
     version: String,
     basePath: String = "/api/v1",
     requireIdempotencyKey: Boolean = true,
+    released: LocalDate = LocalDate.now(),
+    status: ApiStatus = ApiStatus.Active,
 ) {
+    require(SEMVER.matches(version)) { "version must be a semantic version like 1.0.0" }
+    require(status !in setOf(ApiStatus.Alpha, ApiStatus.Beta) || version.startsWith("0.")) {
+        "The major version of an alpha or beta API must be 0"
+    }
     require(basePath.startsWith("/") && !basePath.endsWith("/")) { "basePath must start with / and not end with /" }
     val resources = resources(klerk)
     val openApi by lazy {
@@ -96,6 +113,17 @@ public fun <C : KlerkContext, V> Application.klerkRest(
         route(basePath) {
             get("/openapi.json") {
                 call.respondText(openApi, ContentType.parse("application/vnd.oai.openapi+json"))
+            }
+            get("/api-info") {
+                val info =
+                    buildJsonObject {
+                        put("apiName", title)
+                        put("apiVersion", version)
+                        put("apiReleased", released.toString())
+                        put("apiDocumentation", "${call.apiUrl(basePath)}/openapi.json")
+                        put("apiStatus", status.value)
+                    }
+                call.respondText(info.toString(), ContentType.Application.Json)
             }
             for (resource in resources) {
                 route("/${resource.collection}") {
@@ -179,6 +207,7 @@ private class Rest<C : KlerkContext, V>(
                 value.toIntOrNull()?.let { ModelID<Any>(it) } ?: throw RequestException("Not a model ID: $value")
             }
         val withActions = query["actions"]?.toBooleanStrictOrNull() ?: false
+        val base = call.apiUrl(basePath)
 
         var next: QueryListCursor? = null
         val items =
@@ -188,22 +217,27 @@ private class Rest<C : KlerkContext, V>(
                 @Suppress("UNCHECKED_CAST")
                 val page = (view as ModelView<Any, C>).query(QueryOptions(maxItems = limit, cursor = cursor), filter = filter)
                 next = page.cursorNextPage
-                page.items.map { modelToJson(it, resource, basePath, if (withActions) possibleActions(it) else null) }
+                page.items.map { modelToJson(it, resource, base, if (withActions) possibleActions(it) else null) }
             }
-        next?.let { cursorNext ->
-            val params =
-                query.entries().filter { it.key != "cursor" }.flatMap { (k, vs) -> vs.map { k to it } } +
-                    ("cursor" to cursorNext.toString())
-            val queryString =
-                params.joinToString("&") { (k, v) ->
-                    "${java.net.URLEncoder.encode(k, Charsets.UTF_8)}=${java.net.URLEncoder.encode(v, Charsets.UTF_8)}"
-                }
-            call.response.header(HttpHeaders.Link, "<$basePath/${resource.collection}?$queryString>; rel=\"next\"")
-        }
+        val collectionUrl = "$base/${resource.collection}"
+        val given = query.entries().flatMap { (k, vs) -> vs.map { k to it } }
+        val withoutCursor = given.filter { it.first != "cursor" }
+
+        fun url(params: List<Pair<String, String>>) = if (params.isEmpty()) collectionUrl else "$collectionUrl?${queryString(params)}"
+        val nextUrl = next?.let { url(withoutCursor + ("cursor" to it.toString())) }
+        nextUrl?.let { call.response.header(HttpHeaders.Link, "<$it>; rel=\"next\"") }
         val body =
             buildJsonObject {
+                putJsonObject("_meta") {
+                    put("count", items.size)
+                    put("limit", limit)
+                }
+                putJsonArray("_links") {
+                    add(link("self", url(given), "GET"))
+                    if (cursor != null) add(link("first", url(withoutCursor), "GET"))
+                    nextUrl?.let { add(link("next", it, "GET")) }
+                }
                 putJsonArray("items") { items.forEach { add(it) } }
-                next?.let { put("nextCursor", it.toString()) }
             }
         call.response.header(HttpHeaders.Vary, HttpHeaders.Authorization)
         call.respondText(body.toString(), ContentType.Application.Json)
@@ -218,7 +252,7 @@ private class Rest<C : KlerkContext, V>(
         val found =
             klerk.read(context) {
                 getOrNull(id)?.takeIf { it.props::class == resource.kClass }?.let {
-                    it to modelToJson(it, resource, basePath, possibleActions(it))
+                    it to modelToJson(it, resource, call.apiUrl(basePath), possibleActions(it))
                 }
             } ?: return call.respondProblem(HttpStatusCode.NotFound, "No ${resource.modelName} with ID $id")
         val (model, json) = found
@@ -316,12 +350,12 @@ private class Rest<C : KlerkContext, V>(
                     } else {
                         // The command is committed even if the actor may not read the result.
                         klerk.read(context) {
-                            getOrNull(modelId)?.let { it to modelToJson(it, resource, basePath, possibleActions(it)) }
+                            getOrNull(modelId)?.let { it to modelToJson(it, resource, call.apiUrl(basePath), possibleActions(it)) }
                         }
                     }
                 if (shown == null) return call.respond(HttpStatusCode.NoContent)
                 val (model, json) = shown
-                if (created) call.response.header(HttpHeaders.Location, model.id.href(basePath, resource))
+                if (created) call.response.header(HttpHeaders.Location, model.id.href(call.apiUrl(basePath), resource))
                 call.respondModel(if (created) HttpStatusCode.Created else HttpStatusCode.OK, model, json)
             }
         }

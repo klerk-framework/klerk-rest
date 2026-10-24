@@ -36,7 +36,7 @@ class RestTest {
                     "Bearer anonymous" -> Ctx(Unauthenticated)
                     else -> null
                 }
-            }, "test", "1", requireIdempotencyKey = requireIdempotencyKey)
+            }, "test", "1.0.0", requireIdempotencyKey = requireIdempotencyKey)
         }
     }
 
@@ -58,6 +58,24 @@ class RestTest {
         return if (method == "GET") get("/api/v1$path", configure) else post("/api/v1$path", configure)
     }
 
+    private fun JsonObject.links(): List<JsonObject> = this["_links"]!!.jsonArray.map { it.jsonObject }
+
+    private fun JsonObject.link(rel: String): JsonObject = links().first { it["rel"]!!.jsonPrimitive.content == rel }
+
+    private fun JsonObject.href(rel: String = "self"): String = link(rel)["href"]!!.jsonPrimitive.content
+
+    private fun pathOf(url: String): String =
+        java.net
+            .URI(url)
+            .rawPath
+            .removePrefix("/api/v1") +
+            (
+                java.net
+                    .URI(url)
+                    .rawQuery
+                    ?.let { "?$it" } ?: ""
+            )
+
     private fun HttpResponse.json(text: String): JsonObject = Json.parseToJsonElement(text).jsonObject
 
     private suspend fun HttpClient.createNote(title: String = "hello"): JsonObject {
@@ -73,19 +91,28 @@ class RestTest {
         testApplication {
             serve()
             val note = client.createNote()
-            val href = note["href"]!!.jsonPrimitive.content
+            val href = note.href()
+            assertTrue(href.startsWith("http://localhost"), href)
             assertEquals("Created", note["state"]!!.jsonPrimitive.content)
             assertEquals("hello", note["props"]!!.jsonObject["title"]!!.jsonPrimitive.content)
-            val actions = note["actions"]!!.jsonArray.map { it.jsonObject["event"]!!.jsonPrimitive.content }
-            assertTrue("RenameNote" in actions, actions.toString())
+            assertEquals("POST", note.link("rename-note")["method"]!!.jsonPrimitive.content)
+            assertEquals("RenameNote", note.link("rename-note")["title"]!!.jsonPrimitive.content)
 
             val get = client.get(href) { header(HttpHeaders.Authorization, "Bearer system") }
             assertEquals(HttpStatusCode.OK, get.status)
             assertEquals(note["id"], get.json(get.bodyAsText())["id"])
 
             val list = client.send("GET", "/notes?actions=true")
-            val items = list.json(list.bodyAsText())["items"] as JsonArray
-            assertEquals(1, items.size)
+            val page = list.json(list.bodyAsText())
+            assertEquals(1, (page["items"] as JsonArray).size)
+            assertEquals(
+                1,
+                page["_meta"]!!
+                    .jsonObject["count"]!!
+                    .jsonPrimitive.content
+                    .toInt(),
+            )
+            assertTrue(page.href().endsWith("/notes?actions=true"), page.href())
         }
 
     @Test
@@ -93,8 +120,7 @@ class RestTest {
         testApplication {
             serve()
             val note = client.createNote()
-            val rename = note["actions"]!!.jsonArray.map { it.jsonObject }.first { it["event"]!!.jsonPrimitive.content == "RenameNote" }
-            val response = client.send("POST", rename["href"]!!.jsonPrimitive.content.removePrefix("/api/v1"), body = """{"title":"new"}""")
+            val response = client.send("POST", pathOf(note.href("rename-note")), body = """{"title":"new"}""")
             assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
             assertEquals(
                 "new",
@@ -121,7 +147,7 @@ class RestTest {
         testApplication {
             serve()
             val note = client.createNote()
-            val path = note["href"]!!.jsonPrimitive.content.removePrefix("/api/v1")
+            val path = pathOf(note.href())
             val etag = client.send("GET", path).headers[HttpHeaders.ETag]!!
             assertEquals(HttpStatusCode.NotModified, client.send("GET", path, headers = mapOf("If-None-Match" to etag)).status)
 
@@ -146,9 +172,44 @@ class RestTest {
             val first = client.send("GET", "/notes?limit=2")
             val link = first.headers[HttpHeaders.Link]!!
             assertTrue("rel=\"next\"" in link, link)
-            val next = link.substringAfter("<").substringBefore(">")
-            val second = client.send("GET", next.removePrefix("/api/v1"))
-            assertEquals(1, (second.json(second.bodyAsText())["items"] as JsonArray).size)
+            assertEquals(link.substringAfter("<").substringBefore(">"), first.json(first.bodyAsText()).href("next"))
+            val second = client.send("GET", pathOf(link.substringAfter("<").substringBefore(">")))
+            val secondPage = second.json(second.bodyAsText())
+            assertEquals(1, (secondPage["items"] as JsonArray).size)
+            assertTrue(secondPage.links().none { it["rel"]!!.jsonPrimitive.content == "next" })
+            assertTrue(secondPage.href("first").endsWith("/notes?limit=2"), secondPage.href("first"))
+        }
+
+    @Test
+    fun forwardedHeaderDecidesLinks() =
+        testApplication {
+            serve()
+            val response =
+                client.send(
+                    "POST",
+                    "/notes",
+                    body = """{"title":"x"}""",
+                    headers =
+                        mapOf(
+                            "Forwarded" to "proto=https; host=api.example.se; prefix=/ingest/v1",
+                        ),
+                )
+            val note = response.json(response.bodyAsText())
+            assertTrue(note.href().startsWith("https://api.example.se/ingest/v1/notes/"), note.href())
+            assertTrue(response.headers[HttpHeaders.Location]!!.startsWith("https://api.example.se/ingest/v1/notes/"))
+        }
+
+    @Test
+    fun apiInfoIsServedWithoutAuthentication() =
+        testApplication {
+            serve()
+            val response = client.send("GET", "/api-info", token = null)
+            assertEquals(HttpStatusCode.OK, response.status)
+            val info = response.json(response.bodyAsText())
+            assertEquals("test", info["apiName"]!!.jsonPrimitive.content)
+            assertEquals("1.0.0", info["apiVersion"]!!.jsonPrimitive.content)
+            assertEquals("active", info["apiStatus"]!!.jsonPrimitive.content)
+            assertTrue(info["apiDocumentation"]!!.jsonPrimitive.content.endsWith("/api/v1/openapi.json"))
         }
 
     @Test
@@ -159,7 +220,7 @@ class RestTest {
             assertEquals(HttpStatusCode.Unauthorized, response.status)
             assertTrue("Bearer" in response.headers[HttpHeaders.WWWAuthenticate]!!)
             val note = client.createNote()
-            val path = note["href"]!!.jsonPrimitive.content.removePrefix("/api/v1")
+            val path = pathOf(note.href())
             assertEquals(
                 HttpStatusCode.Forbidden,
                 client.send("POST", "$path/events/annotate-note", token = "anonymous", body = """{"position":{"line":"a"}}""").status,

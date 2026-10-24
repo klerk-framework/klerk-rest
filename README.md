@@ -33,12 +33,13 @@ A model `Book` becomes the collection `books` (`Category` becomes `categories`).
 
 | Request                                    | Does                                                                         |
 |--------------------------------------------|------------------------------------------------------------------------------|
-| `GET /books`                               | One page of a view. Query: `view` (default `all`), `limit` (1–100, default 20), `cursor`, `referencing` (only models that reference the given ID), `actions` (include `actions`, default false). |
+| `GET /books`                               | One page of a view. Query: `view` (default `all`), `limit` (1–100, default 20), `cursor`, `referencing` (only models that reference the given ID), `actions` (include a link for each event the client may execute, default false). |
 | `GET /books/{id}`                          | The book.                                                                    |
 | `POST /books/events/{event}`              | Executes a void event, e.g. `/books/events/create-book`. `201` with `Location`. |
 | `POST /books`                              | Same, when the model has exactly one External void event.                    |
 | `POST /books/{id}/events/{event}`          | Executes an instance event, e.g. `/books/42/events/publish-book`. `200` with the book. |
 | `GET /openapi.json`                        | The OpenAPI document. Needs no authentication.                               |
+| `GET /api-info`                            | `apiName`, `apiVersion`, `apiReleased`, `apiDocumentation` and `apiStatus`. Needs no authentication. |
 
 Event names in URIs are the kebab case of the event name. The body of an event request is a JSON object with the
 event's parameters; leave it out for an event without parameters. An event that changes nothing visible, deletes the
@@ -49,25 +50,34 @@ model or whose result the client may not read gives `204`.
 ```json
 {
   "id": "42",
-  "href": "/api/v1/books/42",
   "type": "Book",
   "state": "Draft",
   "createdAt": "2026-10-24T10:00:00Z",
   "lastModifiedAt": "2026-10-24T10:05:00Z",
   "props": { "title": "Dune" },
-  "actions": [
-    { "event": "PublishBook", "method": "POST", "href": "/api/v1/books/42/events/publish-book" },
+  "_links": [
+    { "rel": "self", "href": "https://example.se/api/v1/books/42", "method": "GET" },
     {
-      "event": "UpdateBook", "method": "POST", "href": "/api/v1/books/42/events/update-book",
-      "params": "/api/v1/openapi.json#/components/schemas/BookUpdateBookParams"
+      "rel": "publish-book", "href": "https://example.se/api/v1/books/42/events/publish-book", "method": "POST",
+      "title": "PublishBook"
+    },
+    {
+      "rel": "update-book", "href": "https://example.se/api/v1/books/42/events/update-book", "method": "POST",
+      "title": "UpdateBook",
+      "params": "https://example.se/api/v1/openapi.json#/components/schemas/BookUpdateBookParams"
     }
   ]
 }
 ```
 
-`actions` are the events the client may execute on the model now. Times are RFC 3339, durations ISO 8601 and positions
-ISO 6709. Decimals are strings. A collection page is `{ "items": [...], "nextCursor": "..." }`; when there is a next
-page the response also has a `Link` header with `rel="next"`. Models the client may not read are left out of lists and
+Besides `self`, `_links` has a link for each event the client may execute on the model now. The `rel` of such a link
+is the event's name in the URI. Links are absolute. Behind a gateway, send `Forwarded: proto=https; host=example.se;
+prefix=/api/v1` (RFC 7239) and the links will point at the gateway; `prefix` is the gateway's base URL of the API.
+
+Times are RFC 3339, durations ISO 8601 and positions ISO 6709. Decimals are strings. A collection page is
+`{ "_meta": { "count": 20, "limit": 20 }, "_links": [...], "items": [...] }`. `_links` has `self`, `first` (when a
+cursor was given) and `next` (when there is a next page); the `next` link is also sent as a `Link` header with
+`rel="next"`. Models the client may not read are left out of lists and
 are `404` when fetched.
 
 ## Caching and concurrency
